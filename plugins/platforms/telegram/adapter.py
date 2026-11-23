@@ -4326,6 +4326,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                         await handler(query, data, chat_id)
                 return
         for prefix, handler in (
+            ("xp:", self._handle_xpost_callback),
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
@@ -4521,6 +4522,37 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         await answer_callback(query, _toast("platform.telegram.prompt.update_sent", answer=answer))
         word = t("platform.telegram.prompt.affirm_word" if answer == "y" else "platform.telegram.prompt.negate_word")
         await self._edit_md_quiet(query, f"☤ {t('platform.telegram.prompt.update_answered', answer=f'*{word}*')}")
+
+    async def _handle_xpost_callback(self, query, data: str, cb: dict[str, Any]) -> None:
+        """Local patch: hand an xpost draft button (``xp:...``) to ``~/xpost/xpost.py tap``.
+
+        xpost (a separate cross-posting tool) owns the logic and replies in the topic itself; the
+        gateway only gates the tap, acknowledges it, and runs the command in the background.
+        """
+        if not await self._callback_authorized(query, cb, _unauthorized()):
+            return
+        parts = data.split(":")
+        verb = parts[1] if len(parts) > 1 else ""
+        target = parts[4].title() if verb == "n" and len(parts) > 4 else "everywhere"
+        await answer_callback(query, ("Dropping…" if verb == "d" else f"Posting to {target}…")[:_TOAST_LIMIT])
+        root = os.path.expanduser("~/xpost")
+        caller_id = str(getattr(query.from_user, "id", ""))
+
+        async def run() -> None:
+            try:
+                from tools.environments.local import build_subprocess_env
+                proc = await asyncio.create_subprocess_exec(
+                    os.path.join(root, ".venv", "bin", "python"), os.path.join(root, "xpost.py"), "tap", data, caller_id,
+                    cwd=root, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE, env=build_subprocess_env(strip_launch_profile=True))
+                _out, err = await asyncio.wait_for(proc.communicate(), timeout=1800)
+                if proc.returncode != 0:
+                    logger.error("[%s] xpost tap failed: data=%s rc=%s stderr=%s", self.name, data,
+                                 proc.returncode, err.decode("utf-8", errors="replace")[-2000:])
+            except Exception as exc:
+                logger.error("[%s] xpost tap error: data=%s err=%s", self.name, data, exc, exc_info=True)
+
+        asyncio.create_task(run())
 
     # `gt:<verb>` -> (script in ~/.hermes/scripts/gmail-triage/, extra-args, success-label, is_state). The callback
     # `arg` is always the first positional arg. is_state=True keeps the keyboard tappable (sticky sender rule);
