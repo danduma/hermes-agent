@@ -3888,6 +3888,14 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- xpost cross-posting buttons (local patch; logic lives in ~/xpost/buttons.py) ---
+        if data.startswith("xp:"):
+            await self._handle_xpost_callback(query, data, query_chat_id=query_chat_id,
+                                              query_chat_type=query_chat_type,
+                                              query_thread_id=query_thread_id,
+                                              query_user_name=query_user_name)
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -4240,6 +4248,39 @@ class TelegramAdapter(BasePlatformAdapter):
         "vip":          ("vip-add.sh",         ["email"],  "✓ marked VIP",         True),
         "vip-domain":   ("vip-add.sh",         ["domain"], "✓ marked VIP domain",  True),
     }
+
+    async def _handle_xpost_callback(self, query, data: str, *, query_chat_id, query_chat_type,
+                                     query_thread_id, query_user_name) -> None:
+        """Hand an xpost draft button to ``xpost.py tap``; xpost replies in the topic itself."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ Not authorized.")
+            return
+        parts = data.split(":")
+        verb = parts[1] if len(parts) > 1 else ""
+        target = parts[4].title() if verb == "n" and len(parts) > 4 else "everywhere"
+        await query.answer(text="Dropping…" if verb == "d" else f"Posting to {target}…")
+        root = _Path.home() / "xpost"
+
+        async def run():
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    str(root / ".venv" / "bin" / "python"), str(root / "xpost.py"), "tap", data, caller_id,
+                    cwd=str(root), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                _out, err = await asyncio.wait_for(proc.communicate(), timeout=1800)
+                if proc.returncode != 0:
+                    logger.error("[%s] xpost tap failed: data=%s rc=%s stderr=%s", self.name, data,
+                                 proc.returncode, err.decode("utf-8", errors="replace")[-2000:])
+            except Exception as exc:
+                logger.error("[%s] xpost tap error: data=%s err=%s", self.name, data, exc, exc_info=True)
+
+        asyncio.create_task(run())
 
     async def _handle_gmail_triage_callback(
         self,
